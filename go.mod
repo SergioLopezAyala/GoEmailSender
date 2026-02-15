@@ -1,4 +1,4 @@
-module awesomeProject1
+module github.com/SergioLopezAyala/GoEmailSender
 
 go 1.25
 
