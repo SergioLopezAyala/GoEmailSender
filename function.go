@@ -1,4 +1,4 @@
-package function
+package awesomeProject1
 
 import (
 	"encoding/json"
