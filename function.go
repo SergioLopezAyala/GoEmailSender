@@ -1,19 +1,17 @@
-package awesomeProject1
+package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/smtp"
 	"os"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
-	"github.com/sendgrid/sendgrid-go"
-	"github.com/sendgrid/sendgrid-go/helpers/mail"
 )
 
 func init() {
-	// Register the HTTP function with the Functions Framework
 	functions.HTTP("SendEmail", SendEmail)
 }
 
@@ -35,25 +33,21 @@ type EmailResponse struct {
 
 // SendEmail is the Cloud Function entry point
 func SendEmail(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers for browser requests
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	// Handle preflight OPTIONS request
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Only accept POST requests
 	if r.Method != http.MethodPost {
 		sendErrorResponse(w, http.StatusMethodNotAllowed, "Only POST method is allowed")
 		return
 	}
 
-	// Parse the request body
 	var emailReq EmailRequest
 	if err := json.NewDecoder(r.Body).Decode(&emailReq); err != nil {
 		log.Printf("Failed to decode request body: %v", err)
@@ -61,39 +55,27 @@ func SendEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate the request
 	if err := validateEmailRequest(&emailReq); err != nil {
 		log.Printf("Validation failed: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Get SendGrid API key from environment variable
-	sendGridAPIKey := os.Getenv("SENDGRID_API_KEY")
-	if sendGridAPIKey == "" {
-		log.Println("SENDGRID_API_KEY environment variable is not set")
-		sendErrorResponse(w, http.StatusInternalServerError, "Email service not configured")
-		return
-	}
-
-	// Send the email
-	if err := sendEmailViaSendGrid(sendGridAPIKey, &emailReq); err != nil {
+	// 🔐 CALL SMTP FUNCTION
+	if err := sendEmailViaSMTP(&emailReq); err != nil {
 		log.Printf("Failed to send email: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to send email: %v", err))
 		return
 	}
 
-	// Send success response
 	response := EmailResponse{
 		Success: true,
 		Message: "Email sent successfully",
 	}
 
 	w.WriteHeader(http.StatusOK)
-	err := json.NewEncoder(w).Encode(response)
-	if err != nil {
-		return
-	}
+	_ = json.NewEncoder(w).Encode(response)
+
 	log.Printf("Email sent successfully to: %s", emailReq.To)
 }
 
@@ -114,34 +96,58 @@ func validateEmailRequest(req *EmailRequest) error {
 	return nil
 }
 
-// sendEmailViaSendGrid sends an email using the SendGrid API
-func sendEmailViaSendGrid(apiKey string, req *EmailRequest) error {
-	// Create SendGrid mail objects
-	from := mail.NewEmail("", req.From)
-	to := mail.NewEmail("", req.To)
+func sendEmailViaSMTP(req *EmailRequest) error {
 
-	// Create the message
-	var message *mail.SGMailV3
+	from := os.Getenv("GMAIL_ADDRESS")
+	if from == "" {
+		return fmt.Errorf("GMAIL_ADDRESS environment variable not set")
+	}
+
+	password := os.Getenv("GMAIL_APP_PASSWORD")
+	if password == "" {
+		return fmt.Errorf("GMAIL_APP_PASSWORD environment variable not set")
+	}
+
+	smtpHost := "smtp.gmail.com"
+	smtpPort := "587"
+
+	auth := smtp.PlainAuth("", from, password, smtpHost)
+
+	// ================================
+	// BUILD EMAIL MESSAGE
+	// ================================
+	var msg string
+
 	if req.HTMLContent != "" {
-		// If HTML content is provided, use it (with optional plain text fallback)
-		message = mail.NewSingleEmail(from, req.Subject, to, req.TextContent, req.HTMLContent)
+		msg = "MIME-version: 1.0;\r\n" +
+			"Content-Type: text/html; charset=\"UTF-8\";\r\n" +
+			fmt.Sprintf("Subject: %s\r\n", req.Subject) +
+			fmt.Sprintf("To: %s\r\n", req.To) +
+			"\r\n" + req.HTMLContent
 	} else {
-		// Plain text only
-		message = mail.NewSingleEmail(from, req.Subject, to, req.TextContent, "")
+		msg = fmt.Sprintf(
+			"Subject: %s\r\nTo: %s\r\n\r\n%s",
+			req.Subject,
+			req.To,
+			req.TextContent,
+		)
 	}
 
-	// Create SendGrid client
-	client := sendgrid.NewSendClient(apiKey)
+	addr := smtpHost + ":" + smtpPort
 
-	// Send the email
-	response, err := client.Send(message)
+	// ================================
+	// SEND EMAIL
+	// ================================
+	err := smtp.SendMail(
+		addr,
+		auth,
+		from,
+		[]string{req.To},
+		[]byte(msg),
+	)
+
 	if err != nil {
-		return fmt.Errorf("sendgrid client error: %w", err)
-	}
-
-	// Check response status
-	if response.StatusCode >= 400 {
-		return fmt.Errorf("sendgrid API error: status %d, body: %s", response.StatusCode, response.Body)
+		return fmt.Errorf("smtp error: %w", err)
 	}
 
 	return nil
@@ -156,8 +162,5 @@ func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
 	}
 
 	w.WriteHeader(statusCode)
-	err := json.NewEncoder(w).Encode(response)
-	if err != nil {
-		return
-	}
+	_ = json.NewEncoder(w).Encode(response)
 }
