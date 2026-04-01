@@ -100,7 +100,6 @@ func sendEmailViaGmailAPI(req *EmailRequest) error {
 		return fmt.Errorf("GMAIL_DWD_SERVICE_ACCOUNT env var not set")
 	}
 
-	// The Workspace mailbox to impersonate — must own the alias hi@dualcore-dev.com
 	impersonateUser := os.Getenv("GMAIL_IMPERSONATE_USER")
 	if impersonateUser == "" {
 		return fmt.Errorf("GMAIL_IMPERSONATE_USER env var not set")
@@ -143,7 +142,6 @@ func sendEmailViaGmailAPI(req *EmailRequest) error {
 
 	raw := base64.URLEncoding.EncodeToString(msg.Bytes())
 
-	// "me" resolves to impersonateUser (admin@dualcore-dev.com) at runtime
 	_, err = srv.Users.Messages.Send("me", &gmail.Message{Raw: raw}).Do()
 	if err != nil {
 		return fmt.Errorf("gmail API send error: %w", err)
