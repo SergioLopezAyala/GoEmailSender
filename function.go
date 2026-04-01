@@ -1,21 +1,25 @@
 package emailSender
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"net/smtp"
 	"os"
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
+	"google.golang.org/api/gmail/v1"
+	"google.golang.org/api/impersonate"
+	"google.golang.org/api/option"
 )
 
 func init() {
 	functions.HTTP("SendEmail", SendEmail)
 }
 
-// EmailRequest represents the incoming email request structure
 type EmailRequest struct {
 	To          string `json:"to"`
 	From        string `json:"from"`
@@ -24,14 +28,12 @@ type EmailRequest struct {
 	HTMLContent string `json:"html_content,omitempty"`
 }
 
-// EmailResponse represents the response structure
 type EmailResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 	Error   string `json:"error,omitempty"`
 }
 
-// SendEmail is the Cloud Function entry point
 func SendEmail(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -61,31 +63,24 @@ func SendEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 🔐 CALL SMTP FUNCTION
-	if err := sendEmailViaSMTP(&emailReq); err != nil {
+	if err := sendEmailViaGmailAPI(&emailReq); err != nil {
 		log.Printf("Failed to send email: %v", err)
 		sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to send email: %v", err))
 		return
 	}
 
-	response := EmailResponse{
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(EmailResponse{
 		Success: true,
 		Message: "Email sent successfully",
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(response)
+	})
 
 	log.Printf("Email sent successfully to: %s", emailReq.To)
 }
 
-// validateEmailRequest validates the email request fields
 func validateEmailRequest(req *EmailRequest) error {
 	if req.To == "" {
 		return fmt.Errorf("'to' field is required")
-	}
-	if req.From == "" {
-		return fmt.Errorf("'from' field is required")
 	}
 	if req.Subject == "" {
 		return fmt.Errorf("'subject' field is required")
@@ -96,71 +91,72 @@ func validateEmailRequest(req *EmailRequest) error {
 	return nil
 }
 
-func sendEmailViaSMTP(req *EmailRequest) error {
+func sendEmailViaGmailAPI(req *EmailRequest) error {
+	ctx := context.Background()
 
-	from := os.Getenv("GMAIL_ADDRESS")
-	if from == "" {
-		return fmt.Errorf("GMAIL_ADDRESS environment variable not set")
+	// The DWD service account email set via Cloud Run env var
+	dwdServiceAccount := os.Getenv("GMAIL_DWD_SERVICE_ACCOUNT")
+	if dwdServiceAccount == "" {
+		return fmt.Errorf("GMAIL_DWD_SERVICE_ACCOUNT env var not set")
 	}
 
-	password := os.Getenv("GMAIL_APP_PASSWORD")
-	if password == "" {
-		return fmt.Errorf("GMAIL_APP_PASSWORD environment variable not set")
+	// The Workspace mailbox to impersonate — must own the alias hi@dualcore-dev.com
+	impersonateUser := os.Getenv("GMAIL_IMPERSONATE_USER")
+	if impersonateUser == "" {
+		return fmt.Errorf("GMAIL_IMPERSONATE_USER env var not set")
 	}
 
-	smtpHost := "smtp.gmail.com"
-	smtpPort := "587"
+	// Always send from the alias — ignore whatever From is passed in the request
+	fromAlias := "hi@dualcore-dev.com"
 
-	auth := smtp.PlainAuth("", from, password, smtpHost)
+	// Keyless auth chain:
+	// Cloud Run SA (ADC) → Token Creator → DWD SA → Workspace user
+	// No JSON key file anywhere in this chain.
+	ts, err := impersonate.CredentialsTokenSource(ctx, impersonate.CredentialsConfig{
+		TargetPrincipal: dwdServiceAccount,
+		Scopes:          []string{gmail.GmailSendScope},
+		Subject:         impersonateUser,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create impersonated token source: %w", err)
+	}
 
-	// ================================
-	// BUILD EMAIL MESSAGE
-	// ================================
-	var msg string
+	srv, err := gmail.NewService(ctx, option.WithTokenSource(ts))
+	if err != nil {
+		return fmt.Errorf("failed to create gmail service: %w", err)
+	}
+
+	// Build the RFC 2822 raw message
+	var msg bytes.Buffer
+	msg.WriteString(fmt.Sprintf("From: %s\r\n", fromAlias))
+	msg.WriteString(fmt.Sprintf("To: %s\r\n", req.To))
+	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", req.Subject))
+	msg.WriteString("MIME-Version: 1.0\r\n")
 
 	if req.HTMLContent != "" {
-		msg = "MIME-version: 1.0;\r\n" +
-			"Content-Type: text/html; charset=\"UTF-8\";\r\n" +
-			fmt.Sprintf("Subject: %s\r\n", req.Subject) +
-			fmt.Sprintf("To: %s\r\n", req.To) +
-			"\r\n" + req.HTMLContent
+		msg.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n\r\n")
+		msg.WriteString(req.HTMLContent)
 	} else {
-		msg = fmt.Sprintf(
-			"Subject: %s\r\nTo: %s\r\n\r\n%s",
-			req.Subject,
-			req.To,
-			req.TextContent,
-		)
+		msg.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n\r\n")
+		msg.WriteString(req.TextContent)
 	}
 
-	addr := smtpHost + ":" + smtpPort
+	raw := base64.URLEncoding.EncodeToString(msg.Bytes())
 
-	// ================================
-	// SEND EMAIL
-	// ================================
-	err := smtp.SendMail(
-		addr,
-		auth,
-		from,
-		[]string{req.To},
-		[]byte(msg),
-	)
-
+	// "me" resolves to impersonateUser (admin@dualcore-dev.com) at runtime
+	_, err = srv.Users.Messages.Send("me", &gmail.Message{Raw: raw}).Do()
 	if err != nil {
-		return fmt.Errorf("smtp error: %w", err)
+		return fmt.Errorf("gmail API send error: %w", err)
 	}
 
 	return nil
 }
 
-// sendErrorResponse sends a JSON error response
 func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
-	response := EmailResponse{
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(EmailResponse{
 		Success: false,
 		Message: "Failed to send email",
 		Error:   message,
-	}
-
-	w.WriteHeader(statusCode)
-	_ = json.NewEncoder(w).Encode(response)
+	})
 }
